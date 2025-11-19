@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Library Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-slate-50 min-h-screen flex items-center justify-center p-4">
+  <div class="w-full max-w-3xl bg-white rounded-2xl shadow-lg overflow-hidden flex flex-col" style="height: 86vh;">
+    
+    <!-- HEADER -->
+    <header class="p-4 border-b flex items-center gap-3">
+      <div class="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center text-white font-bold">LB</div>
+      <div>
+        <h1 class="text-lg font-semibold">Library Assistant</h1>
+        <p class="text-sm text-slate-500">Search • Issue • Renew • Return</p>
+      </div>
+      <div id="connectionStatus" class="ml-auto text-sm text-green-500">Connected</div>
+    </header>
+
+    <!-- MAIN -->
+    <main class="flex-1 p-4 overflow-hidden flex flex-col">
+
+      <!-- MESSAGES -->
+      <div id="messages" class="flex-1 overflow-auto space-y-4"></div>
+
+      <!-- TYPING INDICATOR -->
+      <div id="typing" class="px-4 pb-2 hidden text-sm text-slate-500">
+        Library Bot is typing...
+      </div>
+
+      <!-- BOTTOM CONTROLS -->
+      <div id="controls" class="px-4 pt-2 pb-4 border-t flex flex-col gap-3">
+
+        <!-- INPUT ROUTE -->
+        <div class="flex gap-2 items-center">
+          <input id="searchBox" 
+                 class="flex-1 p-2 rounded-lg border"
+                 placeholder="Type a message or search books..."
+                 type="text" />
+          <button id="btnSearch" 
+                  class="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors">
+            Send
+          </button>
+        </div>
+
+        <!-- SUGGESTIONS AREA -->
+        <div id="suggestArea" class="flex gap-2 flex-wrap"></div>
+
+        <!-- QUICK ACTION BUTTONS -->
+        <div class="flex gap-2 items-center">
+          <button data-action='{"name":"list","page":1,"per_page":5,"category":"all"}'
+                  class="px-3 py-2 rounded-full bg-indigo-100 text-indigo-700 hover:bg-indigo-200 transition-colors">
+            List books
+          </button>
+
+          <button data-action='{"name":"my_books"}'
+                  class="px-3 py-2 rounded-full bg-slate-100 text-slate-700 hover:bg-slate-200 transition-colors">
+            My books
+          </button>
+
+          <div class="ml-auto flex gap-2 text-sm">
+            <button data-cat="all" class="px-3 py-1 rounded-md border hover:bg-slate-50 transition-colors">All</button>
+            <button data-cat="Python" class="px-3 py-1 rounded-md border hover:bg-slate-50 transition-colors">Python</button>
+            <button data-cat="ML" class="px-3 py-1 rounded-md border hover:bg-slate-50 transition-colors">ML</button>
+            <button data-cat="AI" class="px-3 py-1 rounded-md border hover:bg-slate-50 transition-colors">AI</button>
+          </div>
+        </div>
+
+      </div>
+    </main>
+  </div>
+
+<script>
+/*---------------------------------------------------------------------
+  BASIC ELEMENT HOOKS
+---------------------------------------------------------------------*/
+const messagesEl = document.getElementById("messages");
+const typingEl = document.getElementById("typing");
+const searchBox = document.getElementById("searchBox");
+const btnSearch = document.getElementById("btnSearch");
+const suggestArea = document.getElementById("suggestArea");
+const connectionStatus = document.getElementById("connectionStatus");
+
+/*---------------------------------------------------------------------
+  CLIENT ID (PERSISTENT)
+---------------------------------------------------------------------*/
+let clientId = localStorage.getItem("library_bot_client_id");
+if (!clientId) {
+  clientId = "user_" + Math.random().toString(36).slice(2, 9);
+  localStorage.setItem("library_bot_client_id", clientId);
+}
+
+/*---------------------------------------------------------------------
+  WEBSOCKET CONNECT + RECONNECT
+---------------------------------------------------------------------*/
+let ws;
+let retryMs = 500;
+let isIntentionalClose = false;
+let reconnectTimeout = null;
+
+function updateConnectionStatus(status, color = 'slate') {
+  connectionStatus.textContent = status;
+  connectionStatus.className = `ml-auto text-sm text-${color}-500`;
+}
+
+function connectWs() {
+  // Clear any pending reconnection
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${protocol}://${location.host}/ws/${clientId}`;
+  console.log("[WS] Connecting:", url);
+
+  updateConnectionStatus('Connecting...', 'yellow');
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    console.log("[WS] Connected");
+    updateConnectionStatus('Connected', 'green');
+    appendSystem("Connected to Library Assistant.");
+    retryMs = 500;
+    isIntentionalClose = false;
+  };
+
+  ws.onclose = (event) => {
+    console.log("[WS] Disconnected:", event.code, event.reason);
+    updateConnectionStatus('Disconnected', 'red');
+    
+    if (!isIntentionalClose) {
+      appendSystem("Disconnected. Reconnecting...");
+      reconnectTimeout = setTimeout(() => {
+        connectWs();
+      }, retryMs);
+      retryMs = Math.min(retryMs * 2, 8000);
+    }
+  };
+
+  ws.onerror = (err) => {
+    console.error("[WS] Error:", err);
+    updateConnectionStatus('Connection Error', 'red');
+  };
+
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      console.log("[WS] Message:", data);
+      handleServerMessage(data);
+    } catch (err) {
+      console.error("[WS] Parse error:", err);
+      appendSystem("Error parsing server message.");
+    }
+  };
+}
+
+// Add cleanup on page unload
+window.addEventListener('beforeunload', () => {
+  isIntentionalClose = true;
+  if (ws) {
+    ws.close(1000, "Page navigation");
+  }
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+  }
+});
+
+// Manual reconnect button (optional - you can add this to UI if needed)
+function manualReconnect() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    return;
+  }
+  isIntentionalClose = false;
+  connectWs();
+}
+
+/*---------------------------------------------------------------------
+  UI HELPERS
+---------------------------------------------------------------------*/
+function appendSystem(msg) {
+  const div = document.createElement("div");
+  div.className = "text-center text-sm text-slate-400 italic";
+  div.innerText = msg;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function appendMessage(who, html) {
+  const row = document.createElement("div");
+  row.className = who === "user" ? "flex justify-end" : "flex justify-start";
+
+  const bubble = document.createElement("div");
+  bubble.className = "max-w-[70%] p-3 rounded-2xl";
+  bubble.innerHTML = html;
+
+  if (who === "user") {
+    bubble.classList.add("bg-indigo-600", "text-white", "rounded-br-none");
+  } else {
+    bubble.classList.add("bg-slate-100", "text-slate-900", "rounded-bl-none");
+  }
+
+  row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, m => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;",
+  }[m]));
+}
+
+/*---------------------------------------------------------------------
+ SEND MESSAGE (USER → SERVER)
+---------------------------------------------------------------------*/
+function sendMessage(text) {
+  if (!text.trim()) return;
+
+  appendMessage("user", escapeHtml(text));
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ message: text }));
+    } catch (err) {
+      console.error("Error sending message:", err);
+      appendSystem("Failed to send message. Reconnecting...");
+      manualReconnect();
+    }
+  } else {
+    appendSystem("Cannot send — WebSocket not connected. Reconnecting...");
+    manualReconnect();
+  }
+}
+
+/*---------------------------------------------------------------------
+ ENTER KEY → SEND MESSAGE
+---------------------------------------------------------------------*/
+searchBox.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const text = searchBox.value.trim();
+    if (text.length > 0) {
+      sendMessage(text);
+      searchBox.value = "";
+      suggestArea.innerHTML = "";
+    }
+  }
+});
+
+/*---------------------------------------------------------------------
+ BUTTON CLICK SEND
+---------------------------------------------------------------------*/
+btnSearch.onclick = () => {
+  const text = searchBox.value.trim();
+  if (text) {
+    sendMessage(text);
+    searchBox.value = "";
+    suggestArea.innerHTML = "";
+  }
+};
+
+/*---------------------------------------------------------------------
+ INLINE ACTION BUTTON HANDLER (ISSUE / RENEW / RETURN)
+---------------------------------------------------------------------*/
+function attachInlineButtons() {
+  document.querySelectorAll("[data-action]").forEach((btn) => {
+    if (btn.__wired) return;
+    btn.__wired = true;
+
+    btn.onclick = () => {
+      try {
+        const payload = JSON.parse(btn.getAttribute("data-action"));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: payload }));
+        } else {
+          appendSystem("Connection lost. Reconnecting...");
+          manualReconnect();
+        }
+      } catch (err) {
+        console.error("Invalid data-action", err);
+        appendSystem("Error processing action.");
+      }
+    };
+  });
+}
+
+/*---------------------------------------------------------------------
+ QUICK CATEGORY FILTER BUTTONS
+---------------------------------------------------------------------*/
+document.querySelectorAll("[data-cat]").forEach((btn) => {
+  btn.onclick = () => {
+    const cat = btn.getAttribute("data-cat");
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action: { name: "list", page: 1, per_page: 5, category: cat } }));
+    } else {
+      appendSystem("Connection lost. Reconnecting...");
+      manualReconnect();
+    }
+  };
+});
+
+/*---------------------------------------------------------------------
+ MESSAGE HANDLER (SERVER → CLIENT)
+---------------------------------------------------------------------*/
+function handleServerMessage(data) {
+  switch (data.type) {
+
+    case "bot_message":
+      appendMessage("bot", escapeHtml(data.message));
+      break;
+
+    case "typing":
+      typingEl.classList.toggle("hidden", !data.value);
+      break;
+
+    case "prefill":
+      searchBox.value = data.value;
+      searchBox.focus();
+      break;
+
+    case "suggestions":
+      renderSuggestionButtons(data.options);
+      break;
+
+    case "search_results":
+      renderSearchResults(data.results);
+      break;
+
+    case "book_list":
+      renderBookList(data.data);
+      break;
+
+    case "my_books":
+      renderMyBooks(data.items);
+      break;
+  }
+}
+
+/*---------------------------------------------------------------------
+ SUGGESTION BUTTONS
+---------------------------------------------------------------------*/
+function renderSuggestionButtons(options) {
+  suggestArea.innerHTML = "";
+  for (const o of options) {
+    const btn = document.createElement("button");
+    btn.className = "px-3 py-2 rounded-full bg-indigo-100 text-indigo-700 hover:bg-indigo-200 transition-colors";
+    btn.innerText = o.label;
+    btn.onclick = () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: o.action }));
+      } else {
+        appendSystem("Connection lost. Reconnecting...");
+        manualReconnect();
+      }
+    };
+    suggestArea.appendChild(btn);
+  }
+}
+
+/*---------------------------------------------------------------------
+ SEARCH RESULTS WITH INLINE ISSUE BUTTONS
+---------------------------------------------------------------------*/
+function renderSearchResults(items) {
+  if (!items.length) {
+    appendMessage("bot", "No results found.");
+    return;
+  }
+
+  let html = "<strong>Search Results:</strong><br/>";
+  items.forEach((b) => {
+    html += `
+      ${b.id}. ${escapeHtml(b.title)} — ${b.category} — ${b.available ? "✅ Available" : "❌ Not Available"}
+      ${b.available ? `<button class="ml-2 px-2 py-1 text-xs bg-green-500 text-white rounded hover:bg-green-600 transition-colors" data-action='${JSON.stringify({name:"issue_by_id",book_id:b.id})}'>Issue</button>` : ''}
+      <br/>`;
+  });
+
+  appendMessage("bot", html);
+  setTimeout(() => attachInlineButtons(), 50);
+}
+
+/*---------------------------------------------------------------------
+ PAGINATED BOOK LIST
+---------------------------------------------------------------------*/
+function renderBookList(data) {
+  let html = `<strong>Books (page ${data.page}/${data.total_pages}):</strong><br/>`;
+
+  data.items.forEach((b) => {
+    html += `
+    ${b.id}. ${escapeHtml(b.title)} — ${b.category} — ${b.available ? "✅ Available" : "❌ Not Available"}
+    ${b.available ? `<button class="ml-2 px-2 py-1 text-xs bg-green-500 text-white rounded hover:bg-green-600 transition-colors" data-action='${JSON.stringify({name:"issue_by_id",book_id:b.id})}'>Issue</button>` : ''}
+    <br/>`;
+  });
+
+  const nav = `
+    <div class="mt-2 flex gap-2">
+      ${data.page > 1 
+          ? `<button data-action='${JSON.stringify({name:"list",page:data.page-1,per_page:data.per_page,category:"all"})}'
+                     class="px-3 py-1 bg-slate-200 text-sm rounded hover:bg-slate-300 transition-colors">← Previous</button>` 
+          : ""}
+      ${data.page < data.total_pages 
+          ? `<button data-action='${JSON.stringify({name:"list",page:data.page+1,per_page:data.per_page,category:"all"})}'
+                     class="px-3 py-1 bg-slate-200 text-sm rounded hover:bg-slate-300 transition-colors">Next →</button>` 
+          : ""}
+    </div>`;
+
+  appendMessage("bot", html + nav);
+  setTimeout(() => attachInlineButtons(), 50);
+}
+
+/*---------------------------------------------------------------------
+ MY BOOKS VIEW
+---------------------------------------------------------------------*/
+function renderMyBooks(items) {
+  if (!items || items.length === 0) {
+    appendMessage("bot", "You have no borrowed books.");
+    return;
+  }
+
+  let html = "<strong>Your Borrowed Books:</strong><br/>";
+  items.forEach((b) => {
+    const dueDate = new Date(b.due_at);
+    const today = new Date();
+    const daysUntilDue = Math.ceil((dueDate - today) / (1000 * 60 * 60 * 24));
+    const dueClass = daysUntilDue <= 3 ? "text-red-500 font-semibold" : "text-green-500";
+    
+    html += `
+      <div class="mb-2 p-2 border rounded">
+        <strong>${b.book_id}. ${escapeHtml(b.title)}</strong><br/>
+        Issued: ${b.issued_at} — 
+        <span class="${dueClass}">Due: ${b.due_at} (${daysUntilDue} days left)</span><br/>
+        <div class="mt-1 flex gap-2">
+          <button class="px-2 py-1 text-xs bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors" data-action='${JSON.stringify({name:"renew_by_id",book_id:b.book_id})}'>Renew</button>
+          <button class="px-2 py-1 text-xs bg-red-500 text-white rounded hover:bg-red-600 transition-colors" data-action='${JSON.stringify({name:"return_by_id",book_id:b.book_id})}'>Return</button>
+        </div>
+      </div>`;
+  });
+
+  appendMessage("bot", html);
+  setTimeout(() => attachInlineButtons(), 50);
+}
+
+/*---------------------------------------------------------------------
+ INITIALIZE CONNECTION
+---------------------------------------------------------------------*/
+connectWs();
+
+/*---------------------------------------------------------------------
+ AUTO-SCROLL TO BOTTOM WHEN NEW MESSAGES ADDED
+---------------------------------------------------------------------*/
+const observer = new MutationObserver(() => {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+});
+
+observer.observe(messagesEl, {
+  childList: true,
+  subtree: true
+});
+
+/*---------------------------------------------------------------------
+ FOCUS INPUT ON LOAD
+---------------------------------------------------------------------*/
+window.addEventListener('load', () => {
+  searchBox.focus();
+});
+</script>
+
+</body>
+</html>
