@@ -1,4 +1,4 @@
-# server.py (full patched)
+# server.py (updated)
 import os
 import asyncio
 import json
@@ -16,13 +16,12 @@ from sqlalchemy import (Column, Integer, String, DateTime, Boolean, ForeignKey,
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-# NLP models
+# NLP models (kept as original)
 import spacy
 from textblob import TextBlob
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 from rapidfuzz import process as rf_process, fuzz
-
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -78,6 +77,7 @@ class Book(Base):
     reservations = relationship("Reservation", back_populates="book")
 
 
+# NOTE: status now includes 'return_pending' and return_verified boolean
 class Issue(Base):
     __tablename__ = "issues"
     id = Column(Integer, primary_key=True)
@@ -86,7 +86,8 @@ class Issue(Base):
     issued_at = Column(DateTime, nullable=False)
     due_at = Column(DateTime, nullable=False)
     returned_at = Column(DateTime, nullable=True)
-    status = Column(Enum('issued', 'returned', name="issue_status"), default='issued')
+    status = Column(Enum('issued', 'return_pending', 'returned', name="issue_status"), default='issued')
+    return_verified = Column(Boolean, default=False)
 
     user = relationship("User", back_populates="issues")
     book = relationship("Book", back_populates="issues")
@@ -191,6 +192,18 @@ def semantic_title_matches(query: str, db_books: List[Dict], threshold: float = 
     return results
 
 
+# def semantic_title_matches(query: str, db_books: List[Dict], threshold: float = 0.32, limit: int = 5):
+#     q_emb = embedder.encode(query, convert_to_tensor=True)
+#     scored = []
+#     for b in db_books:
+#         emb = embedder.encode(b["title"], convert_to_tensor=True)
+#         sim = float(util.cos_sim(q_emb, emb)[0][0])
+#         scored.append((sim, b))
+#     scored.sort(reverse=True, key=lambda x: x[0])
+#     results = [b for sim,b in scored if sim >= threshold][:limit]
+#     return results
+
+
 async def find_books_db(session: AsyncSession, limit:int=9999):
     q = await session.execute(select(Book))
     rows = q.scalars().all()
@@ -274,7 +287,8 @@ async def book_status_payload(book_row):
     }
 
 async def calculate_fine_for_issue(issue: Issue) -> Optional[Dict]:
-    if issue.returned_at:
+    # Only consider fines if issue is still issued (not returned)
+    if issue.returned_at or issue.status != 'issued':
         return None
     today = datetime.utcnow()
     if issue.due_at and today > issue.due_at:
@@ -298,6 +312,18 @@ async def startup_event():
                 await conn.execute(text("ALTER TABLE books ADD COLUMN IF NOT EXISTS created_at DATETIME DEFAULT CURRENT_TIMESTAMP"))
             except Exception:
                 # ignore if ALTER not supported
+                pass
+
+            # attempt to add return_verified and status columns to issues if absent
+            try:
+                await conn.execute(text("ALTER TABLE issues ADD COLUMN IF NOT EXISTS return_verified BOOLEAN DEFAULT FALSE"))
+            except Exception:
+                pass
+            try:
+                # Add status column defaulting to 'issued' if not exists
+                await conn.execute(text("ALTER TABLE issues ADD COLUMN IF NOT EXISTS status ENUM('issued','return_pending','returned') DEFAULT 'issued'"))
+            except Exception:
+                # Some MySQL engines may not support IF NOT EXISTS for ENUM - ignore if fails
                 pass
 
         # seed sample books if none exist
@@ -337,6 +363,7 @@ async def overdue_checker_task():
     while True:
         try:
             async with AsyncSessionLocal() as session:
+                # only issues that are still actively issued (not returned/pending)
                 q = await session.execute(select(Issue).where(Issue.status == 'issued'))
                 issues = q.scalars().all()
                 for iss in issues:
@@ -502,6 +529,88 @@ async def admin_issues():
         rows = q.all()
         return [{"title": r[1].title, "user": r[2].client_id, "due": r[0].due_at.date().isoformat()} for r in rows]
 
+@app.get("/admin/return_requests")
+async def admin_return_requests():
+    """
+    Return pending return requests for admin review.
+    """
+    async with AsyncSessionLocal() as session:
+        q = await session.execute(
+            select(Issue, Book, User)
+            .join(Book, Issue.book_id == Book.id)
+            .join(User, Issue.user_id == User.id)
+            .where(Issue.status == 'return_pending')
+            .order_by(Issue.returned_at.desc())
+        )
+        rows = q.all()
+        out = []
+        for r in rows:
+            issue = r[0]
+            book = r[1]
+            user = r[2]
+            out.append({
+                "issue_id": issue.id,
+                "title": book.title,
+                "user": user.client_id,
+                "returned_at": issue.returned_at.date().isoformat() if issue.returned_at else None,
+                "due_at": issue.due_at.date().isoformat() if issue.due_at else None
+            })
+        return JSONResponse(out)
+
+@app.post("/admin/approve_return/{issue_id}")
+async def admin_approve_return(issue_id: int):
+    """
+    Admin approves a pending return -> finalize return and increase available_copies.
+    """
+    async with AsyncSessionLocal() as session:
+        issue = await session.get(Issue, issue_id)
+        if not issue:
+            return {"ok": False, "message": "Issue not found."}
+        if issue.status != 'return_pending':
+            return {"ok": False, "message": "Issue is not pending return."}
+        book = await session.get(Book, issue.book_id)
+        # finalize return
+        issue.status = 'returned'
+        issue.return_verified = True
+        if not issue.returned_at:
+            issue.returned_at = datetime.utcnow()
+        # increase available copies but do not exceed total
+        if book:
+            book.available_copies = min(book.total_copies, book.available_copies + 1)
+            session.add(book)
+        session.add(issue)
+        await session.commit()
+        # notify user if connected
+        user = await session.get(User, issue.user_id)
+        if user and user.client_id:
+            await manager.send(user.client_id, {"type":"bot_message", "message": f"Your return for '{book.title}' has been approved by admin. Thank you."})
+        # broadcast for admins (optional) - here we broadcast to any connected clients
+        await manager.broadcast({"type":"bot_message", "message": f"Return approved: {user.client_id} -> '{book.title}' (issue {issue.id})."})
+        return {"ok": True}
+
+@app.post("/admin/reject_return/{issue_id}")
+async def admin_reject_return(issue_id: int):
+    """
+    Admin rejects a pending return -> revert to issued status.
+    """
+    async with AsyncSessionLocal() as session:
+        issue = await session.get(Issue, issue_id)
+        if not issue:
+            return {"ok": False, "message": "Issue not found."}
+        if issue.status != 'return_pending':
+            return {"ok": False, "message": "Issue is not pending return."}
+        issue.status = 'issued'
+        issue.return_verified = False
+        issue.returned_at = None
+        session.add(issue)
+        await session.commit()
+        user = await session.get(User, issue.user_id)
+        book = await session.get(Book, issue.book_id)
+        if user and user.client_id:
+            await manager.send(user.client_id, {"type":"bot_message", "message": f"Your return for '{book.title}' was not accepted by admin. The book is still marked issued. Please contact library staff."})
+        await manager.broadcast({"type":"bot_message", "message": f"Return rejected: {user.client_id} -> '{book.title}' (issue {issue.id})."})
+        return {"ok": True}
+
 @app.get("/admin/reservations")
 async def admin_reservations():
     async with AsyncSessionLocal() as session:
@@ -603,6 +712,7 @@ async def process_action(client_id: str, action: dict):
             return
 
         if name in ("return_by_id","return"):
+            # STRICT flow: create a return request (return_pending) for admin to verify
             book_id = int(action.get("book_id") or action.get("id"))
             async with AsyncSessionLocal() as session:
                 user = await get_or_create_user(session, client_id)
@@ -611,24 +721,15 @@ async def process_action(client_id: str, action: dict):
                 if not issue:
                     await manager.send(client_id, {"type":"bot_message","message":"You don't have this book issued."})
                     return
+                # mark as pending return (do NOT increment available_copies)
                 issue.returned_at = datetime.utcnow()
-                issue.status = 'returned'
-                book = await session.get(Book, book_id)
-                if book:
-                    book.available_copies = min(book.total_copies, book.available_copies + 1)
-                    session.add(book)
+                issue.status = 'return_pending'
+                issue.return_verified = False
                 session.add(issue)
                 await session.commit()
-                await manager.send(client_id, {"type":"bot_message","message":f"Returned '{book.title}'. Thank you."})
-                q2 = await session.execute(select(Reservation).where(Reservation.book_id==book.id).order_by(Reservation.reserved_at))
-                first_res = q2.scalars().first()
-                if first_res:
-                    first_res.notified = True
-                    session.add(first_res)
-                    await session.commit()
-                    reserving_user = await session.get(User, first_res.user_id)
-                    if reserving_user and reserving_user.client_id:
-                        await manager.send(reserving_user.client_id, {"type":"bot_message","message":f"Your reserved book '{book.title}' is now available. Would you like to issue it?"})
+                await manager.send(client_id, {"type":"bot_message","message":f"Return request submitted for '{(await session.get(Book, book_id)).title}'. An admin will verify the returned book."})
+                # broadcast a short message so admin UIs (if connected) know a request arrived
+                await manager.broadcast({"type":"bot_message", "message": f"Return request: user {user.client_id} returned '{(await session.get(Book, book_id)).title}'. Issue id: {issue.id}."})
             return
 
         if name in ("renew_by_id","renew"):
@@ -655,12 +756,10 @@ async def process_action(client_id: str, action: dict):
             async with AsyncSessionLocal() as session:
                 user = await get_or_create_user(session, client_id)
                 q = await session.execute(
-    select(Issue)
-    .where(Issue.user_id == user.id, Issue.status == "issued")
-    .order_by(Issue.due_at)
-)
-
-                # q = await session.execute(select(Issue).where(Issue.user_id==user.id).order_by(Issue.due_at))
+                    select(Issue)
+                    .where(Issue.user_id == user.id, Issue.status == "issued")
+                    .order_by(Issue.due_at)
+                )
                 recs = q.scalars().all()
                 out = []
                 for r in recs:
