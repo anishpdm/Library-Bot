@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Library Admin Panel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+</head>
+
+<body class="bg-slate-100 p-6">
+  <div class="max-w-6xl mx-auto">
+    
+    <h1 class="text-3xl font-bold mb-6">📚 Library Admin Panel</h1>
+
+    <!-- NAV -->
+    <div class="flex gap-4 mb-6">
+
+        <button class="tab-btn bg-slate-200 px-4 py-2 rounded" data-tab="dashboard">
+  Dashboard
+</button>
+
+
+
+      <button class="tab-btn bg-indigo-600 text-white px-4 py-2 rounded" data-tab="books">
+        Books
+      </button>
+      <button class="tab-btn bg-slate-200 px-4 py-2 rounded" data-tab="issues">
+        Issued Books
+      </button>
+      <button class="tab-btn bg-slate-200 px-4 py-2 rounded" data-tab="reservations">
+        Reservations
+      </button>
+      <button class="tab-btn bg-slate-200 px-4 py-2 rounded" data-tab="fines">
+        Fines
+      </button>
+      
+    </div>
+
+    <!-- BOOKS TAB -->
+    <div id="tab-books" class="tab-content">
+      <h2 class="text-xl font-semibold mb-4">Manage Books</h2>
+
+      <!-- ADD BOOK FORM -->
+      <div class="bg-white shadow p-4 rounded mb-6">
+        <h3 class="text-lg font-semibold mb-2">Add New Book</h3>
+        <div class="grid grid-cols-2 gap-4">
+          <input id="b_title" placeholder="Book Title" class="p-2 border rounded" />
+          <input id="b_author" placeholder="Author" class="p-2 border rounded" />
+          <input id="b_category" placeholder="Category (Python/ML/AI)" class="p-2 border rounded" />
+          <input id="b_rack" placeholder="Rack Number" class="p-2 border rounded" />
+          <input id="b_total" type="number" placeholder="Total Copies" class="p-2 border rounded" />
+        </div>
+        <button onclick="addBook()" class="mt-4 bg-green-600 text-white px-4 py-2 rounded">
+          Add Book
+        </button>
+      </div>
+
+      <!-- LIST OF BOOKS -->
+      <div id="booksList" class="bg-white shadow p-4 rounded">
+        Loading books...
+      </div>
+    </div>
+
+    <!-- ISSUED TAB -->
+    <div id="tab-issues" class="tab-content hidden">
+      <h2 class="text-xl font-semibold mb-4">Issued Books</h2>
+      <div id="issuedList" class="bg-white p-4 shadow rounded">Loading...</div>
+    </div>
+
+    <!-- RESERVATIONS TAB -->
+    <div id="tab-reservations" class="tab-content hidden">
+      <h2 class="text-xl font-semibold mb-4">Reservations</h2>
+      <div id="reserveList" class="bg-white p-4 shadow rounded">Loading...</div>
+    </div>
+
+    <!-- FINES TAB -->
+    <div id="tab-fines" class="tab-content hidden">
+      <h2 class="text-xl font-semibold mb-4">Fines</h2>
+      <div id="finesList" class="bg-white p-4 shadow rounded">Loading...</div>
+    </div>
+
+
+    <div id="tab-dashboard" class="tab-content hidden">
+
+  <h2 class="text-xl font-semibold mb-4">Dashboard Analytics</h2>
+
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+    <div class="bg-white p-4 shadow rounded">
+      <h3 class="font-semibold mb-2">Books by Category</h3>
+      <canvas id="chartCategories"></canvas>
+    </div>
+
+    <div class="bg-white p-4 shadow rounded">
+      <h3 class="font-semibold mb-2">Issued vs Reservations</h3>
+      <canvas id="chartIssued"></canvas>
+    </div>
+
+    <div class="bg-white p-4 shadow rounded col-span-2">
+      <h3 class="font-semibold mb-2">Top 5 Issued Books</h3>
+      <canvas id="chartTopBooks"></canvas>
+    </div>
+
+  </div>
+</div>
+
+
+  </div>
+
+
+<script>
+const api = (path) => `http://localhost:8000${path}`;
+
+// TAB SWITCHING
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll(".tab-btn").forEach(b => {
+      b.classList.remove("bg-indigo-600","text-white");
+      b.classList.add("bg-slate-200");
+    });
+    btn.classList.add("bg-indigo-600","text-white");
+    btn.classList.remove("bg-slate-200");
+
+    const tab = btn.getAttribute("data-tab");
+    document.querySelectorAll(".tab-content").forEach(ct => ct.classList.add("hidden"));
+    document.getElementById("tab-" + tab).classList.remove("hidden");
+
+    loadData();
+  };
+});
+
+// LOAD DATA
+async function loadData() {
+  loadBooks();
+  loadIssued();
+  loadReservations();
+  loadFines();
+}
+
+// LOAD BOOKS
+async function loadBooks() {
+  const res = await fetch(api("/admin/books"));
+  const data = await res.json();
+
+  let html = `<table class="w-full text-left">
+    <tr class="border-b font-semibold">
+      <td>ID</td><td>Title</td><td>Category</td>
+      <td>Rack</td><td>Available</td><td>Actions</td>
+    </tr>`;
+
+  data.forEach(b => {
+    html += `
+      <tr class="border-b">
+        <td>${b.id}</td>
+        <td>${b.title}</td>
+        <td>${b.category}</td>
+        <td>${b.rack}</td>
+        <td>${b.available_copies}/${b.total_copies}</td>
+        <td>
+          <button onclick="deleteBook(${b.id})" class="text-red-600">Delete</button>
+        </td>
+      </tr>`;
+  });
+
+  html += "</table>";
+
+  document.getElementById("booksList").innerHTML = html;
+}
+
+// ADD BOOK
+async function addBook() {
+  const payload = {
+    title: b_title.value,
+    author: b_author.value,
+    category: b_category.value,
+    rack: b_rack.value,
+    total_copies: parseInt(b_total.value)
+  };
+
+  await fetch(api("/admin/add_book"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  alert("Book added!");
+  loadBooks();
+}
+
+// DELETE BOOK
+async function deleteBook(id) {
+  if (!confirm("Delete this book?")) return;
+
+  await fetch(api(`/admin/delete_book/${id}`), { method: "DELETE" });
+
+  alert("Book deleted");
+  loadBooks();
+}
+
+// ISSUED
+async function loadIssued() {
+  const res = await fetch(api("/admin/issues"));
+  const data = await res.json();
+
+  let html = `<h3 class='font-semibold mb-2'>Issued Books</h3>`;
+  data.forEach(i => {
+    html += `
+      <div class="border-b py-2">
+        <strong>${i.title}</strong> → ${i.user}  
+        (Due: ${i.due})
+      </div>`;
+  });
+
+  document.getElementById("issuedList").innerHTML = html;
+}
+
+// RESERVATIONS
+async function loadReservations() {
+  const res = await fetch(api("/admin/reservations"));
+  const data = await res.json();
+
+  let html = `<h3 class="font-semibold mb-2">Reservations</h3>`;
+  data.forEach(r => {
+    html += `
+      <div class="border-b py-2">
+        <strong>${r.title}</strong> reserved by ${r.user}
+        <span class='text-sm text-slate-500'>(${r.date})</span>
+      </div>`;
+  });
+
+  document.getElementById("reserveList").innerHTML = html;
+}
+
+// FINES
+async function loadFines() {
+  const res = await fetch(api("/admin/fines"));
+  const data = await res.json();
+
+  let html = `<h3 class="font-semibold mb-2">Pending Fines</h3>`;
+  data.forEach(f => {
+    html += `
+      <div class="border-b py-2">
+        ${f.user} → <strong>${f.title}</strong>
+        <br>Fine: ₹${f.amount}
+        <button onclick="markFinePaid(${f.id})" class="ml-2 bg-green-600 text-white px-2 py-1 rounded text-sm">
+          Mark Paid
+        </button>
+      </div>`;
+  });
+
+  document.getElementById("finesList").innerHTML = html;
+}
+
+// MARK FINE PAID
+async function markFinePaid(id) {
+  await fetch(api(`/admin/pay_fine/${id}`), { method: "POST" });
+  alert("Fine marked as paid");
+  loadFines();
+}
+
+
+if (localStorage.getItem("isAdmin") !== "true") {
+    window.location.href = "/static/admin_login.html";
+}
+
+
+async function loadDashboard() {
+  const res = await fetch("/admin/stats");
+  const data = await res.json();
+
+  renderCategoryChart(data.categories);
+  renderIssuedChart(data.issued, data.reservations);
+  renderTopBooks(data.top_books);
+}
+
+function renderCategoryChart(items) {
+  new Chart(document.getElementById("chartCategories"), {
+    type: "pie",
+    data: {
+      labels: items.map(i => i.category),
+      datasets: [{ data: items.map(i => i.count) }]
+    }
+  });
+}
+
+function renderIssuedChart(issued, reservations) {
+  new Chart(document.getElementById("chartIssued"), {
+    type: "bar",
+    data: {
+      labels: ["Issued Books", "Reservations"],
+      datasets: [{ data: [issued, reservations] }]
+    }
+  });
+}
+
+function renderTopBooks(items) {
+  new Chart(document.getElementById("chartTopBooks"), {
+    type: "bar",
+    data: {
+      labels: items.map(i => i.title),
+      datasets: [{ data: items.map(i => i.count) }]
+    }
+  });
+}
+
+// When dashboard tab clicked
+document.querySelector("[data-tab='dashboard']").onclick = () => loadDashboard();
+
+</script>
+
+</body>
+</html>
